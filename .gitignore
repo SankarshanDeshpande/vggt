@@ -1,0 +1,19 @@
+# Large binary data — never commit these
+data/
+checkpoints/
+outputs/pointclouds/*.ply
+*.pt
+*.pth
+*.ckpt
+*.jgz
+
+# Notebooks with heavy inline image outputs — too large for GitHub
+
+# Python/Jupyter junk
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# HPC logs
+*.out
+*.err
