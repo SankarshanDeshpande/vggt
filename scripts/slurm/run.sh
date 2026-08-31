@@ -5,7 +5,7 @@
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 #SBATCH --nodelist=node1
-#SBATCH --gres=shard:50
+#SBATCH --gres=shard:20
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=04:00:00
