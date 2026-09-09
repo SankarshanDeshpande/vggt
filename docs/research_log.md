@@ -156,3 +156,71 @@ room0 structure confirmed: color/ (.jpg), depth/ (.png, uint16 mm, 0 = invalid),
 - Separately, root-caused and fixed a torchvision C++ extension load failure (RuntimeError: Couldn't load custom C++ ops) that had been silently present since the very first command in this env (visible as a suppressed warning: Failed to load image Python extension) but only became fatal once nms/batched_nms (used by SAM's automatic mask generator) was actually invoked. Fixed by reinstalling torchvision==0.15.2 explicitly matched to the pinned torch==2.0.1+cu118 build via the PyTorch wheel index, rather than relying on a plain pip install torchvision==0.15.2 (which had installed a build with mismatched/missing compiled ops). Also downgraded numpy<2 in this env, since the reinstalled torchvision's compiled extensions were built against NumPy 1.x and emitted _ARRAY_API not found warnings under NumPy 2.x (non-fatal here, but a known source of silent incorrect results if left unaddressed).
 - Environment-setup notes accumulated getting to this point (same category of issue as throughout this project, listed for reference): conceptgraph package requires activating the conceptgraph conda env specifically (not vlm) since it was pip install -e .'d there; several dependencies were missing from the original Step 1 install list and surfaced one at a time on first real run — open3d, imageio, natsort, and gradslam (which had apparently not persisted correctly from its original Step 3 install and needed reinstalling with --no-build-isolation). Also re-learned the "must run on a GPU compute node, not the login node" lesson in this new env, same as with the LLaVA test — srun --partition=gpu --qos=normal --gres=shard:20 ... used to get GPU access for testing. Added persistent env vars (REPLICA_ROOT, REPLICA_CONFIG_PATH, GSA_PATH, LLAVA_CKPT_PATH) to ~/.bashrc so they survive across terminal sessions and env switches going forward.
 - Also confirmed: the dataconfig's png_depth_scale: 6553.5 matches this Replica variant's actual depth encoding — not the /1000.0 (millimeters) scale factor used in the earlier Phase-E-adjacent GT-vs-VGGT AbsRel depth comparison code. That comparison's numbers, if already computed, need to be redone with the correct scale factor before being trusted/reported.
+
+## Phase G — Remaining Replica scenes, pipeline scoping, architecture review
+
+- **VGGT inference completed on all 5 Replica scenes** (`room0`, `room1`, `room2`, `office0`,
+  `office1`) using the fully corrected pipeline (padding mask via `original_coords`, absolute
+  confidence threshold, true unmirrored coordinates with camera-only orientation control, custom
+  z-buffer renderer) — the same code that produced the verified-correct room0/pyramid results
+  earlier in this phase. All outputs (`*_inputs.png`, `*_sweep.png`, `*_final.png`, per-scene `.ply`)
+  saved to `outputs/pointclouds/`. This completes the qualitative portion of Stage 2 (VGGT
+  reconstruction) for the full 5-scene set — dissertation figures for all scenes now exist and are
+  trustworthy, no re-run needed.
+- **Scoped two known gaps for later, explicitly not blocking current work:**
+  - **VGGT-to-Replica-GT coordinate alignment is not implemented.** Confirmed this only matters for
+    Stage 5's planned quantitative "3D reconstruction accuracy vs. ground truth" evaluation
+    (Chamfer distance / point-to-point error would be meaningless without first rigidly aligning
+    VGGT's arbitrary-scale, first-camera-frame coordinate system to Replica's GT frame, e.g. via
+    Umeyama alignment). Does **not** block ConceptGraphs (Stage 3/4), which only needs internally
+    self-consistent pose/depth/intrinsics per scene, not an external reference frame — confirmed by
+    `run_slam_rgb.py`'s success on room0 without any such alignment. Deferred until Stage 5 is
+    actually reached.
+  - **Matplotlib/z-buffer visualization quality is a display-only concern, not a data-pipeline
+    concern.** ConceptGraphs consumes VGGT's raw depth/pose/intrinsic tensors directly
+    (`depth_map`, `extrinsic`, `intrinsic`) and never touches the custom renderer built for visual
+    sanity-checking in Jupyter — confirmed no dependency between them. Improving render clarity is a
+    dissertation-figure-polish task, decoupled from pipeline correctness.
+  - **Reviewed the overall project architecture against a supervisor-facing flowchart** (5-stage
+    pipeline: Data Prep → VGGT reconstruction → ConceptGraphs scene graph → Scene LLM reasoning →
+    Applications/Evaluation) and identified one structural gap worth flagging: the "Scene LLM"
+    stage (natural-language Q&A/planning over the finished graph) is **not a component ConceptGraphs
+    provides out of the box** — its own LLM calls (`refine-node-captions`, `build-scenegraph`) are
+    embedded inside the graph-*construction* stage, not a separate queryable interface. Building a
+    conversational/task-planning layer on top of the exported graph JSON will be custom work, to be
+    scoped separately when reaching that stage.
+
+## Phase H — GPT-4 → free local model redirect (Ollama)
+
+- **Installed Ollama as a standalone binary inside the `vlm` conda env's own `bin`/`lib` folders**
+  (not system-wide, not a separate env) — since Ollama has no Python dependencies, this just makes
+  it available on PATH only when `vlm` is active. Official install script's direct `.tgz` download
+  URL is dead (Ollama switched to `.tar.zst` format at some point) — fixed by querying GitHub's
+  releases API directly for the current real asset filename rather than guessing, then extracting
+  with `tar --zstd`.
+- **Ollama's model registry blob storage (`*.r2.cloudflarestorage.com`, Cloudflare R2) is
+  unreachable from this network** — confirmed not HPC-specific: the exact same timeout occurred
+  from a personal Windows laptop on a different network, ruling out an HPC firewall as the cause
+  and pointing to a broader block/routing issue with that specific CDN endpoint. `ollama pull`
+  therefore cannot be used at all in this environment.
+- **Fix: bypassed Ollama's registry entirely.** Downloaded a GGUF-format checkpoint
+  (`bartowski/Meta-Llama-3.1-8B-Instruct-GGUF`, `Q4_K_M` quantization, ~4.9GB) directly from
+  Hugging Face — a domain already confirmed reliable throughout this project — then registered it
+  as a local Ollama model via a minimal `Modelfile` (`FROM <path-to-gguf>`) and `ollama create`,
+  which never touches the R2 blob-storage path. Verified with a real chat completion request
+  (`curl .../v1/chat/completions`) returning a coherent response.
+- **Patched `conceptgraph/scenegraph/build_scenegraph_cfslam.py`** to redirect both GPT-4 call
+  sites (`refine_node_captions`, and the relation-extraction step in `build-scenegraph` mode) to
+  the local Ollama server: set `openai.api_base = "http://localhost:11434/v1"`, changed both
+  `model="gpt-4"` to `model="llama3.1-gguf"`, and gave `OPENAI_API_KEY` a placeholder fallback
+  value (the SDK only checks the key is non-empty when hitting a custom `api_base`, never
+  validates it). Confirmed feasible in advance by inspecting the code: both calls use the
+  pre-1.0 `openai` SDK's `ChatCompletion.create()` syntax, which respects a redirectable
+  `api_base` — installed `openai==0.28.1` in `conceptgraph` to match, since this env had no
+  `openai` package at all until now and the current (1.x) SDK removed that calling style entirely.
+- **This closes out all three prerequisite blockers identified for the ConceptGraphs pipeline**:
+  dataset-format compatibility (Phase G), the detection/segmentation stage validated at scale
+  (Phase G — 400/400 frames, room0), and now the GPT-4 dependency, at zero API cost. Local model
+  currently runs on CPU (~24 tokens/sec observed) rather than GPU — acceptable for now given
+  correctness was the priority; worth revisiting only if per-object captioning across 5 scenes
+  turns out too slow in practice.
