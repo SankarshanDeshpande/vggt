@@ -262,3 +262,32 @@ room0 structure confirmed: color/ (.jpg), depth/ (.png, uint16 mm, 0 = invalid),
   "vase" in 9/10 crops). This noise is precisely what the next stage (`refine-node-captions`) is
   designed to resolve via LLM-based synthesis across the caption set — not treated as a defect here.
 - Output saved to `room0/sg_cache/cfslam_llava_captions.json`.
+
+## Phase K — `refine-node-captions`: LLM-based caption synthesis via local Ollama — room0
+
+- Ran `refine-node-captions` on all 76 objects, using the GPT-4→Ollama redirect
+  (`llama3.1-gguf`) patched in Phase H. **This is the first real production use of the redirect**,
+  not just a connectivity test.
+- **Environment/networking issue found and fixed**: the Ollama server and the Jupyter kernel were
+  running on different machines (`svnithpc` login node vs. `node1` compute node), so
+  `localhost:11434` resolved to two different hosts and the client got `Connection refused` despite
+  the server itself running fine. Fixed by starting Ollama from a JupyterLab-native terminal
+  (guaranteed same node as the kernel), not an independent SSH session. Worth remembering for future
+  sessions: Ollama must be (re)started on whichever node the active Jupyter kernel is running on.
+- **Result: 76/76 objects processed, 63 successful summaries, 13 flagged `"invalid"` by design** —
+  6 from genuinely empty caption sets (objects whose crops were all filtered by the `small object`
+  size threshold during Phase J captioning), 7 from genuinely contradictory captions across an
+  object's crops (e.g. "a large rock or boulder" vs. "a close-up of a human brain" — a real
+  detection/segmentation misalignment for that object). Both cases are correct behavior of the
+  quality-filtering step, not errors — these 13 objects will be excluded in the next
+  (`build-scenegraph`) stage per `min_views_per_object`/invalid-tag filtering already present in
+  ConceptGraphs' own code.
+- **Qualitative check on the 63 valid summaries**: synthesis quality is good — noisy, sometimes
+  contradictory per-crop captions (e.g. object 3: "painting"/"boat"×6/"book") correctly resolved to
+  sensible single tags (object 3 → `"boat"`, majority vote essentially). Confirms `llama3.1-gguf`
+  is adequate for this summarization task despite running on CPU only.
+- Runtime: ~7 minutes for 76 LLM calls (~5.5s/call average) — CPU inference, no GPU offload
+  attempted yet; acceptable for a single scene, worth revisiting if scaling to many scenes makes
+  this a bottleneck.
+- Output saved to `room0/sg_cache/cfslam_gpt-4_responses/` (per-object JSON) and
+  `cfslam_gpt-4_responses.pkl`.
