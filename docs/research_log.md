@@ -224,3 +224,41 @@ room0 structure confirmed: color/ (.jpg), depth/ (.png, uint16 mm, 0 = invalid),
   currently runs on CPU (~24 tokens/sec observed) rather than GPU — acceptable for now given
   correctness was the priority; worth revisiting only if per-object captioning across 5 scenes
   turns out too slow in practice.
+
+## Phase J — `extract-node-captions`: per-object LLaVA captioning — room0
+
+- Ran the captioning stage on all 76 objects from the Phase I mapping output. Confirmed a real
+  cross-environment interface mismatch: `conceptgraph`'s pinned `transformers==4.31.0` (kept low to
+  avoid the earlier `torchaudio` ABI crash with GroundingDINO) lacks `LlavaForConditionalGeneration`/
+  the modern LLaVA `AutoProcessor` API entirely (`ImportError: cannot import name
+  'LlavaForConditionalGeneration'`), while `vlm` (transformers 4.57.6) has it. Rather than relax
+  `conceptgraph`'s pin and risk re-breaking GroundingDINO, ran the captioning step as a **subprocess
+  in `vlm`**, invoked from a Jupyter cell running in the `conceptgraph` kernel — cleanly separates
+  the two environments' conflicting requirements without touching either.
+- Two further small bugs surfaced and were fixed once actually exercised (both in
+  `build_scenegraph_cfslam.py`, not the LLaVA wrapper itself):
+  - `import rich` alone doesn't guarantee `rich.console` is accessible as an attribute in the
+    installed `rich` version — added an explicit `import rich.console`.
+  - The CLI's `ProgramArgs` dataclass has fields (`max_detections_per_object`,
+    `masking_option`, etc.) not present on a minimal hand-built `SimpleNamespace` args stand-in —
+    switched to importing and instantiating the real `ProgramArgs` dataclass directly (with only
+    `mode`/`cachedir`/`mapfile` overridden), which supplies correct defaults for everything else and
+    avoids this class of error recurring in the next two modes (`refine-node-captions`,
+    `build-scenegraph`).
+- **Revisited and fixed the `llava_model_hf.py` interface gap flagged (but left unresolved) when the
+  wrapper was first written**: the real caller in `build_scenegraph_cfslam.py` calls
+  `chat.encode_image(tensor)` then `chat(query=..., image_features=tensor)` as two separate steps —
+  the old v0-architecture calling pattern. Our HF-native rewrite needs image+text processed together
+  in one call to correctly expand the `<image>` placeholder token. Fixed by having `encode_image()`
+  stash whatever tensor it's given, then in `__call__`, running the processor once on a dummy image
+  to get correctly-shaped `<image>` token expansion, and swapping in the real stashed tensor as
+  `pixel_values` before generation — avoids any change to the calling code in
+  `build_scenegraph_cfslam.py` itself.
+- **Result: all 76 objects captioned successfully, 0 errors, ~6.5 minutes total runtime** (subprocess
+  overhead + model load ~15s, then ~5s/object average for up to 10 detections each). Per-object
+  captions are noisy at the individual-crop level (expected — occlusion/angle/background-detection
+  variance across the up-to-10 highest-confidence crops per object) but show a clear dominant/modal
+  description per object in most cases (e.g. object 1 → "wooden table" in 6/10 crops; object 6 →
+  "vase" in 9/10 crops). This noise is precisely what the next stage (`refine-node-captions`) is
+  designed to resolve via LLM-based synthesis across the caption set — not treated as a defect here.
+- Output saved to `room0/sg_cache/cfslam_llava_captions.json`.
