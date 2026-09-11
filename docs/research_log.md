@@ -291,3 +291,72 @@ room0 structure confirmed: color/ (.jpg), depth/ (.png, uint16 mm, 0 = invalid),
   this a bottleneck.
 - Output saved to `room0/sg_cache/cfslam_gpt-4_responses/` (per-object JSON) and
   `cfslam_gpt-4_responses.pkl`.
+
+## Phase L — `build-scenegraph`, mesh reconstruction, and full-pipeline summary — room0
+
+- **`build-scenegraph` timeout issue and fix**: initial attempts failed with every relation-extraction
+  LLM call hitting the hardcoded 25-second timeout (`TIMEOUT = 25` in
+  `build_scenegraph_cfslam.py`), producing all-FAIL relations. Root cause: relation prompts are
+  longer than the caption-refinement prompts that worked fine in Phase K, and CPU-only Ollama
+  inference (~24 tok/sec) couldn't complete them in time. Fixed by patching `TIMEOUT` to 120s at
+  both call sites.
+- **Cross-node Ollama connectivity issue recurred and was solved properly this time**: since
+  `build-scenegraph` needed to run via `sbatch` (interactive Jupyter attempts kept timing out even
+  at 120s, suggesting the workload was too long for a live session) but Ollama was running as an
+  independent background process on a specific node, node placement mismatches caused repeated
+  `Connection refused` errors. **Fixed by having the sbatch script itself start Ollama as its first
+  step**, inside the same job allocation — this guarantees server and Python script are always
+  co-located, regardless of which node Slurm assigns, and doesn't depend on any separate
+  interactive session staying alive.
+- **Result**: 68 of 76 objects retained after pruning (8 removed — objects with `"invalid"` tags
+  from Phase K's caption refinement, both the empty-caption and contradictory-caption cases).
+  Bounding-box overlap graph computed, connected components identified via minimum spanning tree,
+  and pairwise object relations extracted via the local LLM for spatially-adjacent object pairs
+  within each component. This produces the final scene graph: 68 nodes (objects with clean tags),
+  edges labeled with inferred spatial/semantic relations (e.g. "next to", "on top of").
+- **First full 3D scene visualization produced**, using data already on disk (didn't require
+  waiting for `build-scenegraph` to finish, since the object map itself was available from Phase
+  I): loaded `full_pcd_..._post.pkl.gz`, extracted per-object `pcd_np`/`pcd_color_np` (real RGB,
+  not segmentation color), rendered with the existing z-buffer renderer — produced a
+  true-color point-cloud reconstruction of the full room with visible furniture, wall texture, and
+  floor detail.
+- **Progressed to mesh reconstruction for higher visual quality**: built an Open3D point cloud from
+  the same object-level points, voxel-downsampled (0.01), estimated normals, ran Poisson surface
+  reconstruction (depth=9, 593k vertices / 1.18M triangles), trimmed low-density (low-confidence)
+  regions, exported as `.ply`.
+- **In-notebook headless rendering (Open3D `OffscreenRenderer`) failed with `eglInitialize failed`**
+  — confirmed via diagnostic that this is a genuine environment limitation, not a missing-library
+  issue (all EGL/GL/Mesa `.so` files are present via `ldconfig -p`), most likely because this
+  compute allocation exposes the GPU for CUDA compute but not for a display/rendering context.
+  `Xvfb` (alternate headless X-server rendering path) is not installed and not installable without
+  root. **Resolution: transferred the `.ply` to a local machine and rendered in MeshLab instead** —
+  works well, produces properly lit, shaded mesh renders closely matching reference figure quality
+  from the SceneLLM paper's own "3D scene" panel.
+- **Diagnosed a rendering artifact** (irregular blue patches on floor/ceiling in the MeshLab mesh
+  view) — initially misattributed to window glass by pattern-matching to an earlier, different
+  point-cloud artifact; corrected after visual inspection of the actual mesh view showed the
+  patches are on floor/ceiling, not window locations. Real cause: Poisson-filled low-confidence
+  regions (areas with too few real points — under furniture, unobserved corners) rendering with a
+  fallback/default color, compounded by possible backface/normal-orientation issues. Documented
+  fixes (not yet applied): raise the post-Poisson density trim threshold, denser input point cloud
+  (smaller voxel size before meshing), check MeshLab's double-sided lighting setting.
+- **Confirmed and documented explicitly: the full pipeline requires no depth sensor.** VGGT predicts
+  depth from RGB alone; Replica's ground-truth depth was used only for the separate Phase E AbsRel
+  accuracy comparison, never as a pipeline dependency. The same VGGT→ConceptGraphs chain already
+  demonstrated on `pyramid.mp4` (a plain video, no depth data) proves this works identically for
+  ordinary phone-camera footage of a real room — a key claim for the dissertation ("sensorless
+  reconstruction on commodity hardware"), not yet executed on an actual self-captured room but
+  architecturally and empirically supported by everything run so far.
+- **Full pipeline summary (RGB images/video → 3D scene graph), for reference:**
+  1. Input: RGB image sequence (any source — dataset color frames, video frames, phone photos)
+  2. VGGT inference → per-frame depth + camera poses, no depth sensor required
+  3. Grounded-SAM → per-frame 2D object detection/segmentation (class-agnostic)
+  4. `cfslam_pipeline_batch.py` → back-projects detections into 3D using VGGT depth+pose, fuses
+     repeated observations into single 3D objects (76 objects, room0)
+  5. `extract-node-captions` (LLaVA) → per-object natural-language captions from best crops
+  6. `refine-node-captions` (local LLM via Ollama) → synthesizes noisy captions into one clean tag
+     per object, flags un-summarizable objects as invalid (13/76 here)
+  7. `build-scenegraph` (local LLM via Ollama) → infers pairwise object relations, assembles final
+     graph (68 nodes after pruning invalid objects)
+  8. Visualization (built here, not part of ConceptGraphs itself): point cloud → Poisson mesh →
+     rendered in MeshLab for photorealistic output
